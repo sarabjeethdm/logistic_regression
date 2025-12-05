@@ -8,7 +8,7 @@ from pymongo import MongoClient
 from rich.logging import RichHandler
 
 logging.basicConfig(
-    level="DEBUG",
+    level=logging.INFO,
     format="%(message)s",
     datefmt="[%X]",
     handlers=[RichHandler(rich_tracebacks=True)],
@@ -21,14 +21,40 @@ edps_claims_collection = os.getenv("EDPS_CLAIMS_COLLECTION")
 pharmacy_claims_collection = os.getenv("PHARMACY_CLAIMS_COLLECTION")
 eligibility_collection = os.getenv("ELIGIBILITY_COLLECTION")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+mbi_crosswalk_collection = os.getenv("MBI_CROSSWALK_COLLECTION")
 
 LLM_MODEL = "gpt-4o-mini"
 llm_client = OpenAI(api_key=OPENAI_API_KEY)
 
+MBI_CROSSWALK_MAP = {}
+
+
+def get_mbi_crosswalk_map():
+    """Fetch MemberID -> MBI mapping from Mongodb and return as dict."""
+    try:
+        with MongoClient(MONGODB_URI) as client:
+            db = client[Database_Name]
+            projection = {"_id": 0, "created_dt": 0}
+            cursor = db[mbi_crosswalk_collection].find({}, projection)
+
+            crosswalk_map = {
+                doc.get("MemberID"): doc.get("MBI")
+                for doc in cursor
+                if doc.get("MemberID") is not None and doc.get("MBI") is not None
+            }
+
+            return crosswalk_map
+
+    except Exception as e:
+        logging.error(f"Failed to load MBI crosswalk map: {e}")
+        return {}
 
 
 def load_members_with_claims_from_docs(eligibility_docs):
     """Given a list of eligibility documents, fetch medical & pharmacy claims."""
+
+    global MBI_CROSSWALK_MAP
+
     try:
         client = MongoClient(MONGODB_URI)
         db = client[Database_Name]
@@ -41,9 +67,11 @@ def load_members_with_claims_from_docs(eligibility_docs):
     for el in eligibility_docs:
         member_id = el["memberId"]
 
+        mbi_lookup_id = MBI_CROSSWALK_MAP.get(member_id, member_id)
+
         # EDPS medical claims
         medical_claims_cursor = db[edps_claims_collection].find(
-            {"Member.Subscriber_ID": member_id},
+            {"Member.Subscriber_ID": mbi_lookup_id},
             {
                 "_id": 0,
                 "Diagnosis.Diag_Codes": 1,
@@ -114,10 +142,13 @@ def load_members_with_claims_from_docs(eligibility_docs):
 def call_llm_for_suspects(members):
     """Calls the LLM to generate suspects for a batch of members."""
     prompt = f"""
-You are a clinical AI assistant. Identify possible 'suspects' (undiagnosed or missing chronic conditions) 
-for the following members using their medical claims, pharmacy claims, and eligibility data.
+You are a clinical AI assistant.
 
-Return results in JSON exactly like this:
+Return your answer as **strict raw JSON only**.
+Do NOT include markdown formatting, backticks, comments, or explanations.
+The response MUST be valid JSON and MUST NOT contain ```json or ```.
+
+Output format:
 [
   {{
     "memberId": "...",
@@ -188,7 +219,9 @@ def process_all_members(batch_size: int = 100):
         logging.error(f"Error connecting to MongoDB: {e}")
         return
 
-    cursor = db[eligibility_collection].find({}, {"_id": 0, "createdAt": 0, "updatedAt": 0})
+    cursor = db[eligibility_collection].find(
+        {}, {"_id": 0, "createdAt": 0, "updatedAt": 0}
+    )
     batch = []
     total_processed = 0
 
@@ -214,7 +247,10 @@ def process_all_members(batch_size: int = 100):
 
 
 if __name__ == "__main__":
-    logging.info("Starting batch processing for all members...")
-    process_all_members(batch_size=100)
-    logging.info("Processing complete.")
+    logging.info("Loading MBI crosswalk map into memory...")
+    MBI_CROSSWALK_MAP = get_mbi_crosswalk_map()
+    logging.info(f"Loaded {len(MBI_CROSSWALK_MAP)} crosswalk records.")
 
+    logging.info("Starting batch processing for all members...")
+    process_all_members(batch_size=10)
+    logging.info("Processing complete.")
