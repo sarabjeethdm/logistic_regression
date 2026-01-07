@@ -1,200 +1,251 @@
-import json
 import logging
 import os
+from datetime import datetime, timezone
+from collections import defaultdict
 
 from dotenv import load_dotenv
-from openai import OpenAI
-from pymongo import MongoClient
+from pymongo import MongoClient, UpdateOne
+from pymongo.errors import BulkWriteError
 from rich.logging import RichHandler
 
+
+# -----------------------------------------------------------
+# Logging Setup
+# -----------------------------------------------------------
 logging.basicConfig(
-    # level="NOTSET",
-    level="DEBUG",
+    level=logging.INFO,
     format="%(message)s",
     datefmt="[%X]",
     handlers=[RichHandler(rich_tracebacks=True)],
 )
 
+# -----------------------------------------------------------
+# Environment
+# -----------------------------------------------------------
 load_dotenv()
-
-# MongoDB config
 MONGODB_URI = os.getenv("MONGODB_URI")
 Database_Name = os.getenv("DATABASE")
+
 edps_claims_collection = os.getenv("EDPS_CLAIMS_COLLECTION")
 pharmacy_claims_collection = os.getenv("PHARMACY_CLAIMS_COLLECTION")
 eligibility_collection = os.getenv("ELIGIBILITY_COLLECTION")
-member_suspect_collection = os.getenv("UI_MEMBER_SUSPECTS_COLLECTION")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-# OpenAI config
-LLM_MODEL = "gpt-4o-mini"
-llm_client = OpenAI(api_key=OPENAI_API_KEY)
+mbi_crosswalk_collection = os.getenv("MBI_CROSSWALK_COLLECTION")
+staging_suspects_collection = os.getenv("STAGING_SUSPECTS_COLLECTION")
 
 
-def load_members_with_claims(batch_size: int = 100):
-    """Pulls member + medical claims + pharmacy claims from the 3 collections."""
+# -----------------------------------------------------------
+# Utility Functions
+# -----------------------------------------------------------
+def safe_date(val):
+    if not val:
+        return None
     try:
-        client = MongoClient(MONGODB_URI)
-        db = client[Database_Name]
-        logging.info("Connected to MongoDB")
-    except Exception as e:
-        logging.error(f"Error connecting to MongoDB: {e}")
-        return []
+        return val.strftime("%Y-%m-%d")
+    except:
+        return None
 
-    eligibility_docs = list(
-        db[eligibility_collection]
-        .find({}, {"_id": 0, "createdAt": 0, "updatedAt": 0})
-        .limit(batch_size)
+
+def get_mbi_crosswalk_map(client):
+    """Return MemberID → MBI mapping."""
+    db = client[Database_Name]
+    cursor = db[mbi_crosswalk_collection].find({}, {"_id": 0, "created_dt": 0})
+
+    mapping = {}
+    for doc in cursor:
+        mid = doc.get("MemberID")
+        mbi = doc.get("MBI")
+        if mid and mbi:
+            mapping[str(mid)] = mbi
+
+    cursor.close()
+    return mapping
+
+
+# -----------------------------------------------------------
+# Claim Fetcher (Batch Optimized)
+# -----------------------------------------------------------
+def batch_fetch_medical_claims(db, mbi_list):
+    """
+    Fetch all medical claims for a batch of MBIs using $in — huge speed improvement.
+    """
+    med_map = defaultdict(list)
+
+    cursor = db[edps_claims_collection].find(
+        {"Member.Subscriber_ID": {"$in": mbi_list}},
+        {
+            "_id": 0,
+            "Diagnosis.Diag_Codes": 1,
+            "ServiceLine": 1,
+            "Claim": 1,
+            "Type_of_Bill": 1,
+            "Provider": 1,
+            "Member.Subscriber_ID": 1,
+        },
     )
-    logging.info(f"Pulled {len(eligibility_docs)} members from eligibility collection")
 
-    members = []
+    for doc in cursor:
+        key = doc.get("Member", {}).get("Subscriber_ID")
+        if key:
+            med_map[key].append(doc)
 
-    for el in eligibility_docs:
-        member_id = el["memberId"]
-        logging.info(f"Processing member ID: {member_id}")
+    cursor.close()
+    return med_map
 
-        # EDPS medical claims
-        medical_claims_cursor = db[edps_claims_collection].find(
-            {"Member.Subscriber_ID": member_id},
+
+def batch_fetch_pharmacy_claims(db, member_ids):
+    """
+    Fetch pharmacy claims for many members using $in.
+    """
+    pharm_map = defaultdict(list)
+
+    cursor = db[pharmacy_claims_collection].find(
+        {"Member ID": {"$in": member_ids}},
+        {
+            "_id": 0,
+            "Member ID": 1,
+            "NDC": 1,
+            "Product Label Name": 1,
+            "Fill Date": 1,
+            "Days Supply": 1,
+            "Metric Quantity": 1,
+            "Prescriber ID": 1,
+            "Prescriber Name": 1,
+            "Total Billed": 1,
+        },
+    )
+
+    for pc in cursor:
+        member_id = str(pc.get("Member ID"))
+        pharm_map[member_id].append(
             {
-                "_id": 0,
-                "Diagnosis.Diag_Codes": 1,
-                "ServiceLine.LXServiceNo": 1,
-                "ServiceLine.BilledCPT_Code": 1,
-                "ServiceLine.Billed_CPTDesc": 1,
-                "ServiceLine.Line_SvcDate": 1,
-                "Claim.ClaimID": 1,
-                "Claim.POS": 1,
-                "Type_of_Bill": 1,
-                "Provider.BillProv_NPI": 1,
-                "Provider.BillProv_LastName": 1,
-                "Member.Subscriber_ID": 1,
-                "Member.Subscriber_DOB": 1,
-                "Member.Subscriber_Gender": 1,
-            },
-        )
-        medical_claims = list(medical_claims_cursor)
-
-        # Pharmacy claims
-        pharmacy_claims_cursor = db[pharmacy_claims_collection].find(
-            {"Member ID": member_id},
-            {
-                "_id": 0,
-                "Member ID": 1,
-                "NDC": 1,
-                "Product Label Name": 1,
-                "Fill Date": 1,
-                "Days Supply": 1,
-                "Metric Quantity": 1,
-                "Prescriber ID": 1,
-                "Prescriber Name": 1,
-                "Total Billed": 1,
-            },
-        )
-
-        pharmacy_claims = [
-            {
-                "memberId": pc.get("Member ID"),
-                "ndc": str(pc.get("NDC")),
+                "memberId": member_id,
+                "ndc": str(pc.get("NDC")) if pc.get("NDC") else None,
                 "drugName": pc.get("Product Label Name"),
-                "fillDate": (
-                    pc.get("Fill Date").strftime("%Y-%m-%d")
-                    if pc.get("Fill Date")
-                    else None
-                ),
+                "fillDate": safe_date(pc.get("Fill Date")),
                 "daysSupply": pc.get("Days Supply"),
                 "quantityDispensed": pc.get("Metric Quantity"),
                 "prescriberNPI": pc.get("Prescriber ID"),
                 "prescriberName": pc.get("Prescriber Name"),
                 "totalBilled": pc.get("Total Billed"),
             }
-            for pc in pharmacy_claims_cursor
-        ]
-
-        members.append(
-            {
-                "memberId": member_id,
-                "eligibility": el,
-                "medicalClaims": medical_claims,
-                "pharmacyClaims": pharmacy_claims,
-            }
         )
 
-    return members
+    cursor.close()
+    return pharm_map
 
 
-def call_llm_for_suspects(members):
-    """Calls the LLM to generate suspects for a batch of members."""
-    prompt = f"""
-You are a clinical AI assistant. Identify possible 'suspects' (undiagnosed or missing chronic conditions) 
-for the following members using their medical claims, pharmacy claims, and eligibility data.
-
-Return results in JSON exactly like this:
-[
-  {{
-    "memberId": "...",
-    "suspectType": "...",
-    "suspectDiagnosis": {{
-      "code": "...",
-      "description": "...",
-      "hccCategory": "..."
-    }},
-    "confidenceScore": 0.85,
-    "priority": "...",
-    "evidence": {{
-      "summary": "...",
-      "details": ["...", "..."]
-    }},
-    "suggestedAction": "..."
-  }}
-]
-
-Members: {members}
-"""
-    response = llm_client.chat.completions.create(
-        model=LLM_MODEL,
-        messages=[
-            {"role": "system", "content": "You are a clinical assistant."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.0,
-    )
-
-    llm_output_text = response.choices[0].message.content
-
+# -----------------------------------------------------------
+# Bulk Write Helper
+# -----------------------------------------------------------
+def execute_bulk(collection, ops):
     try:
-        suspects = json.loads(llm_output_text)
-    except json.JSONDecodeError:
-        logging.error("Failed to decode LLM response")
-        logging.error(llm_output_text)
-        suspects = []
-
-    return suspects
-
-
-def save_suspects_to_mongo(suspects):
-    """Saves suspect records to MongoDB collection ui.member.suspects"""
-    if not suspects:
-        logging.info("No suspects to save")
-        return
-
-    try:
-        client = MongoClient(MONGODB_URI)
-        db = client[Database_Name]
-        db["ui.member.suspects"].insert_many(suspects)
-        logging.info(f"Saved {len(suspects)} suspect records to ui.member.suspects")
+        result = collection.bulk_write(ops, ordered=False)
+        logging.info(
+            f"BulkWrite → matched={result.matched_count}, "
+            f"modified={result.modified_count}, "
+            f"upserted={len(result.upserted_ids)}"
+        )
+    except BulkWriteError as bwe:
+        logging.error(f"BulkWriteError: {bwe.details}")
     except Exception as e:
-        logging.error(f"Error saving suspects: {e}")
+        logging.error(f"Unexpected bulk write error: {e}")
 
 
+# -----------------------------------------------------------
+# Main Loader
+# -----------------------------------------------------------
+def load_members_claims_to_database(batch_size=500):
+    client = MongoClient(MONGODB_URI)
+    db = client[Database_Name]
+    suspects_coll = db[staging_suspects_collection]
+
+    logging.info("Loading MBI crosswalk map...")
+    mbi_map = get_mbi_crosswalk_map(client)
+    logging.info(f"Loaded {len(mbi_map)} MBI entries")
+
+    logging.info("Starting eligibility streaming cursor...")
+    cursor = db[eligibility_collection].find({}, {"_id": 0})
+
+    total_processed = 0
+    batch = []
+
+    for el in cursor:
+        batch.append(el)
+
+        if len(batch) >= batch_size:
+            process_batch(batch, db, suspects_coll, mbi_map)
+            total_processed += len(batch)
+            batch = []
+
+    # final batch
+    if batch:
+        process_batch(batch, db, suspects_coll, mbi_map)
+        total_processed += len(batch)
+
+    cursor.close()
+    client.close()
+
+    logging.info(f"Completed processing. Total members processed: {total_processed}")
+
+
+# -----------------------------------------------------------
+# Batch Processor (FAST VERSION)
+# -----------------------------------------------------------
+def process_batch(batch, db, suspects_coll, mbi_map):
+
+    member_ids = [str(el["memberId"]) for el in batch]
+    mbi_list = [mbi_map.get(mid, mid) for mid in member_ids]
+
+    logging.info(f"Fetching claims for batch of {len(batch)} members...")
+
+    # ---- Batch fetch claims (HUGE SPEED-UP)
+    medical_map = batch_fetch_medical_claims(db, mbi_list)
+    pharmacy_map = batch_fetch_pharmacy_claims(db, member_ids)
+
+    now = datetime.now(timezone.utc)
+    ops = []
+
+    for i, el in enumerate(batch):
+        mid = member_ids[i]
+        mbi_lookup = mbi_list[i]
+
+        doc = {
+            "memberId": mid,
+            "eligibility": el,  # no undot, much faster
+            "medicalClaims": medical_map.get(mbi_lookup, []),
+            "pharmacyClaims": pharmacy_map.get(mid, []),
+            "updatedAt": now,
+            "createdAt": now,
+        }
+
+        update = {
+            "$set": {
+                "eligibility": doc["eligibility"],
+                "medicalClaims": doc["medicalClaims"],
+                "pharmacyClaims": doc["pharmacyClaims"],
+                "updatedAt": now,
+            },
+            "$setOnInsert": {
+                "createdAt": now,
+                "memberId": mid,
+            },
+        }
+
+        ops.append(UpdateOne({"memberId": mid}, update, upsert=True))
+
+        # write in bigger batches for speed
+        if len(ops) >= 500:
+            execute_bulk(suspects_coll, ops)
+            ops = []
+
+    # remaining ops
+    if ops:
+        execute_bulk(suspects_coll, ops)
+
+
+# -----------------------------------------------------------
+# Entry Point
+# -----------------------------------------------------------
 if __name__ == "__main__":
-    logging.info("Starting to load members with claims...")
-    member_data = load_members_with_claims(batch_size=10)
-    logging.info(f"Loaded data for {len(member_data)} members")
+    load_members_claims_to_database(batch_size=500)
 
-    logging.info("Calling LLM to generate suspects...")
-    suspects = call_llm_for_suspects(member_data)
-
-    logging.info(f"LLM returned {len(suspects)} suspect records")
-    save_suspects_to_mongo(suspects)
